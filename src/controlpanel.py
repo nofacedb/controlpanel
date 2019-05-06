@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import sys
 import threading
 from base64 import b64decode
@@ -13,8 +14,9 @@ from re import match
 from PyQt5 import QtGui
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QRect, QPoint
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QPainter, QPaintEvent, QPen, QMouseEvent
-from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QLabel, QLineEdit, QTabWidget, QPushButton
-from aiohttp import web
+from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QLabel, QLineEdit, QTabWidget, QPushButton, QMessageBox, \
+    QFileDialog
+from aiohttp import web, ClientSession
 
 APP_NAME = 'ControlPanel'
 LOGO_PATH = '../static/logo/logo.png'
@@ -51,9 +53,16 @@ class FaceBox:
 
 
 class FaceTabsWidget(QTabWidget):
-    def __init__(self, faces):
+    def __init__(self, faces_data):
         super().__init__()
-        self.faces = faces
+        self.faces_data = faces_data
+        self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+
+
+class PushButtonOnce(QPushButton):
+    def __init__(self, name: str, parent):
+        super().__init__(name, parent)
+        self.first_time = True
 
 
 class FaceTab(QWidget):
@@ -71,6 +80,7 @@ class FaceTab(QWidget):
         self.__init_face_tab()
 
     def __init_face_tab(self):
+        self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
         self.grid = QGridLayout()
         self.setLayout(self.grid)
         positions = [((0, 0), (0, 1)),
@@ -115,13 +125,14 @@ class FaceTab(QWidget):
         self.phone_num.setText(self.face.get('phone_num'))
         self.grid.addWidget(self.phone_num, *positions[4][1])
 
-        self.delete_button = QPushButton('delete', self)
-        self.grid.addWidget(self.delete_button, *positions[5])
-        self.delete_button.clicked.connect(self.buttonClicked)
+        self.delete_btn = QPushButton('delete', self)
+        self.delete_btn.setToolTip("""'delete' button removes this face from image.""")
+        self.delete_btn.clicked.connect(self.delete_btn_clicked)
+        self.grid.addWidget(self.delete_btn, *positions[5])
 
-    def buttonClicked(self):
+    def delete_btn_clicked(self):
         self.parent.removeTab(self.index)
-        del self.parent.faces[self.index]
+        del self.parent.faces_data[self.index]
         for i in range(self.index, self.parent.count()):
             w = self.parent.widget(i)
             w.index = i
@@ -129,17 +140,17 @@ class FaceTab(QWidget):
 
 
 class NotificationWindow(QWidget):
-    def __init__(self, win_name: str, win_width: int, win_height: int, pix_map: QPixmap, faces):
+    def __init__(self, win_name: str, headers, id, pix_map: QPixmap, faces_data, outmq: Queue):
         super().__init__()
         self.win_name = win_name
-        self.win_width = win_width
-        self.win_height = win_height
+        self.headers = headers
+        self.id = id
         self.pix_map = pix_map
-        self.faces = faces
+        self.faces_data = faces_data
+        self.outmq = outmq
         self.__init_notification_window()
 
     def __init_notification_window(self):
-        self.resize(self.win_width, self.win_height)
         self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
         self.setWindowTitle(self.win_name)
         self.setWindowIcon(QIcon(self.pix_map))
@@ -147,24 +158,124 @@ class NotificationWindow(QWidget):
         self.grid = QGridLayout()
         self.setLayout(self.grid)
 
-        self.drawing_area = Painter(self.pix_map, self.faces, self)
-        self.grid.addWidget(self.drawing_area, 0, 0)
+        self.drawing_area = Painter(self.pix_map, self.faces_data, self)
+        self.grid.addWidget(self.drawing_area, 0, 0, 5, 1)
 
-        self.faces_widget = FaceTabsWidget(self.faces)
-        for i in range(len(self.faces)):
-            face_tab = FaceTab(i, self.faces[i], self.faces_widget)
+        self.submit_btn = PushButtonOnce('submit', self)
+        self.submit_btn.setToolTip("""'submit' button sends all faces data to server.<br>
+        You can't undo it.""")
+        self.submit_btn.setCheckable(True)
+        self.submit_btn.clicked.connect(self.submit_btn_clicked)
+        self.grid.addWidget(self.submit_btn, 0, 1)
+
+        self.recognize_again_btn = PushButtonOnce('recognize again', self)
+        self.recognize_again_btn.setToolTip("""'recognize again' button asks server to recognize all faces again.<br>
+        It is useful, when You've removed (added) some face data from (to) image.""")
+        self.recognize_again_btn.setCheckable(True)
+        self.recognize_again_btn.clicked.connect(self.recognize_again_btn_clicked)
+        self.grid.addWidget(self.recognize_again_btn, 1, 1)
+
+        self.cancel_btn = PushButtonOnce('cancel', self)
+        self.cancel_btn.setToolTip("""'cancel' button drops image<br>
+        (its faces data will not be saved).<br>
+        You can't undo it.""")
+        self.cancel_btn.setCheckable(True)
+        self.cancel_btn.clicked.connect(self.cancel_btn_clicked)
+        self.grid.addWidget(self.cancel_btn, 2, 1)
+
+        self.save_data_btn = PushButtonOnce('save data', self)
+        self.save_data_btn.setToolTip("""'save data' button saves image and its faces data to selected path<br>
+        (image will be saved as '/path.png', faces data - as '/path.json'""")
+        self.save_data_btn.clicked.connect(self.save_data_btn_clicked)
+        self.grid.addWidget(self.save_data_btn, 3, 1)
+
+        self.faces_widget = FaceTabsWidget(self.faces_data)
+        for i in range(len(self.faces_data)):
+            face_tab = FaceTab(i, self.faces_data[i], self.faces_widget)
             self.faces_widget.addTab(face_tab, str(face_tab.index))
-        self.grid.addWidget(self.faces_widget, 0, 1)
+        self.grid.addWidget(self.faces_widget, 4, 1)
+
+    def save_data_btn_clicked(self):
+        fname = QFileDialog.getSaveFileName(self, 'Save data', '/home/mikhail/')[0]
+        img_name = fname + '.png'
+        self.pix_map.save(img_name)
+        data_name = fname + '.json'
+        with open(data_name, 'w') as out:
+            json.dump({'faces_data': self.faces_data}, out,
+                      ensure_ascii=False, indent=4, sort_keys=True)
+
+    def update_faces_data(self):
+        for i in range(len(self.faces_data)):
+            self.faces_data[i]['name'] = self.faces_widget.widget(i).name.text()
+            self.faces_data[i]['patronymic'] = self.faces_widget.widget(i).patronymic.text()
+            self.faces_data[i]['surname'] = self.faces_widget.widget(i).surname.text()
+            self.faces_data[i]['passport'] = self.faces_widget.widget(i).passport.text()
+            self.faces_data[i]['phone_num'] = self.faces_widget.widget(i).phone_num.text()
+
+    def submit_btn_clicked(self):
+        self.submit_btn.setChecked(True)
+        if not self.submit_btn.first_time or \
+                self.recognize_again_btn.isChecked() or \
+                self.cancel_btn.isChecked():
+            return
+        self.submit_btn.first_time = False
+        self.update_faces_data()
+        msg = {
+            'headers': {'src_addr': '', 'immed': False},
+            'cmd': 'submit',
+            'id': self.id,
+            'faces_data': self.faces_data
+        }
+        print(self.faces_data)
+        self.outmq.put(msg)
+
+    def recognize_again_btn_clicked(self):
+        self.recognize_again_btn.setChecked(True)
+        if not self.recognize_again_btn.first_time or \
+                self.recognize_again_btn.isChecked() or \
+                self.cancel_btn.isChecked():
+            return
+        self.recognize_again_btn.first_time = False
+        self.update_faces_data()
+        msg = {
+            'headers': {'src_addr': '', 'immed': False},
+            'cmd': 'recognize_again',
+            'id': self.id,
+            'faces_data': self.faces_data
+        }
+        self.outmq.put(msg)
+
+    def cancel_btn_clicked(self):
+        self.cancel_btn.setChecked(True)
+        if not self.cancel_btn.first_time or \
+                self.recognize_again_btn.isChecked() or \
+                self.cancel_btn.isChecked():
+            return
+        self.cancel_btn.first_time = False
+        msg = {
+            'headers': {'src_addr': '', 'immed': False},
+            'cmd': 'cancel',
+            'id': self.id
+        }
+        self.outmq.put(msg)
+
+    def closeEvent(self, event):
+        reply = QMessageBox.question(self, 'Message', "Are you sure to quit?", QMessageBox.Yes | QMessageBox.No,
+                                     QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            event.accept()
+        else:
+            event.ignore()
 
     def run(self):
         self.show()
 
 
 class Painter(QWidget):
-    def __init__(self, pix_map: QPixmap, faces, parent: NotificationWindow):
+    def __init__(self, pix_map: QPixmap, faces_data, parent: NotificationWindow):
         super().__init__()
         self.pix_map = pix_map
-        self.faces = faces
+        self.faces_data = faces_data
         self.win_width = self.pix_map.width()
         self.win_height = self.pix_map.height()
         self.setFixedSize(self.win_width, self.win_height)
@@ -205,7 +316,7 @@ class Painter(QWidget):
                 else self.released_coords.y()
             left = self.pressed_coords.x() if self.pressed_coords.x() >= self.released_coords.x() \
                 else self.released_coords.x()
-            self.faces.append({
+            self.faces_data.append({
                 'box': [top, right, bottom, left],
                 'name': '',
                 'patronymic': '',
@@ -213,7 +324,7 @@ class Painter(QWidget):
                 'passport': '',
                 'phone_num': ''
             })
-            face_tab = FaceTab(len(self.faces) - 1, self.faces[-1], self.parent.faces_widget)
+            face_tab = FaceTab(len(self.faces_data) - 1, self.faces_data[-1], self.parent.faces_widget)
             self.parent.faces_widget.addTab(face_tab, str(face_tab.index))
         self.update()
         self.pressed_coords = None
@@ -230,8 +341,8 @@ class Painter(QWidget):
         painter.drawPixmap(QRect(0, 0, self.pix_map.width(), self.pix_map.height()), self.pix_map)
         painter.setPen(QPen(Qt.green, 3))
         painter.setFont(QFont("DejaVu Sans Mono", 18, QtGui.QFont.PreferDefault))
-        for i in range(len(self.faces)):
-            fb = FaceBox(self.faces[i].get('box'))
+        for i in range(len(self.faces_data)):
+            fb = FaceBox(self.faces_data[i].get('box'))
             rect = QRect(fb.right, fb.top, fb.left - fb.right, fb.bottom - fb.top)
             painter.drawRect(rect)
             painter.drawText(rect, Qt.AlignBottom | Qt.AlignCenter, str(i))
@@ -290,7 +401,13 @@ class GUI(QWidget):
         self.grid.addWidget(guide, *positions[1])
 
     def msg_trigger_cb(self):
-        msg = self.mq.get()
+        p = self.mq.get()
+        msg = p[0]
+        outmq = p[1]
+
+        headers = msg.get('headers')
+
+        id = msg.get('id')
 
         b64_img_buff = msg.get('img_buff')
         img_buff = b64decode(b64_img_buff)
@@ -299,9 +416,9 @@ class GUI(QWidget):
         pix_map = QPixmap()
         pix_map.loadFromData(buff.getvalue())
 
-        faces = msg.get('faces')
+        faces_data = msg.get('faces_data')
 
-        nw = NotificationWindow('NW', 1000, 1000, pix_map, faces)
+        nw = NotificationWindow('NW', headers, id, pix_map, faces_data, outmq)
         self.sub_windows.append(nw)
         nw.run()
 
@@ -311,21 +428,38 @@ class GUI(QWidget):
 
 
 class AppCtx:
-    def __init__(self, gui: GUI):
+    def __init__(self, immed_resp: bool, gui: GUI, loop: asyncio.BaseEventLoop):
+        self.immed_resp = immed_resp
         self.gui = gui
+        self.loop = loop
 
     async def handler(self, req: web.Request) -> web.Response:
+        print('kek')
         msg = await req.json()
-        self.gui.mq.put(msg)
-        self.gui.msg_trigger.sig.emit()
-        return web.Response()
+        outmq = Queue()
+        p = (msg, outmq)
+        if self.immed_resp:
+            self.gui.mq.put(p)
+            self.gui.msg_trigger.sig.emit()
+            asyncio.run_coroutine_threadsafe(self.create_response(outmq), loop=self.loop)
+            return web.json_response({'headers': {'src_addr': '', 'immed': True}})
+
+        self.gui.mq.put(p)
+        msg = outmq.get()
+        return web.json_response(msg)
+
+    async def create_response(self, outmq: Queue):
+        msg = outmq.get()
+        async with ClientSession(
+                json_serialize=json.dumps) as session:
+            await session.put('http://127.0.0.1:10000' + '/api/v1/put_control', json=msg)
 
 
 def server(args, loop: asyncio.BaseEventLoop, gui: GUI) -> int:
     asyncio.set_event_loop(loop)
     """server_face_recognition starts asynchronous face recognition server"""
     app = web.Application(client_max_size=args.reqmaxsize)
-    app_ctx = AppCtx(gui)
+    app_ctx = AppCtx(args.immedresp, gui, loop)
     app.add_routes([web.put('/', app_ctx.handler)])
     # Well, I know that make_handler method is deprecated, but
     # aiohttp documentation sucks, so I can't understand how to use
@@ -364,6 +498,8 @@ def parse_args():
                         help='path to yaml config file')
     parser.add_argument('-s', '--socket', type=str, default='',
                         help='IP:PORT or path to UNIX-Socket')
+    parser.add_argument('--immedresp', action='store_true',
+                        help='specifies, if server should return answer immediately')
     parser.add_argument('--reqmaxsize', type=int, default=1024 ** 2,
                         help='client request max size in bytes (default: %(default)s))')
     parser.add_argument('-i', '--input', type=str, default='',
