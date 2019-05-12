@@ -4,40 +4,27 @@
 import argparse
 import asyncio
 import json
+import os
+import ssl
 import sys
 import threading
 from base64 import b64decode
 from io import BytesIO
-from queue import Queue
+from pathlib import Path
 from re import match
+from time import clock
 
+import janus
+import yaml
 from PyQt5 import QtGui
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QRect, QPoint
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QPainter, QPaintEvent, QPen, QMouseEvent
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QLabel, QLineEdit, QTabWidget, QPushButton, QMessageBox, \
-    QFileDialog
+    QFileDialog, QMainWindow, QAction
 from aiohttp import web, ClientSession
 
-APP_NAME = 'ControlPanel'
-LOGO_PATH = '../static/logo/logo.png'
-WIDTH_COEF = 0.5
-HEIGHT_COEF = 0.5
-GUIDE_TEXT = '''
-Welcome to <a href='https://github.com/nofacedb/controlpanel'>ControlPanel</a>,
-one component of the <a href='https://github.com/nofacedb'>NoFaceDB</a> project.
-<br><br>
-ControlPanel starts HTTP-server on address, specified by yaml configuration file, and<br>
-handles notifications from FaceDB module. After getting notification ControlPanel<br>
-creates new subwindow with image and faces information from it and then You can<br>
-check if faces are recognized correctly.
-<br><br>
-This is ControlPanel 0.1 (build 1, PyQT5 Version 12.1+) of 2019-05-02
-<br><br>
-Copyright (C) Mikhail Masyagin 2019
-'''
 
-
-class MsgTrigger(QObject):
+class UserTrigger(QObject):
     sig = pyqtSignal()
 
 
@@ -94,35 +81,35 @@ class FaceTab(QWidget):
         name_title.setText(FaceTab.NAME_TITLE)
         self.grid.addWidget(name_title, *positions[0][0])
         self.name = QLineEdit()
-        self.name.setText(self.face.get('name'))
+        self.name.setText(self.face['cob']['name'])
         self.grid.addWidget(self.name, *positions[0][1])
 
         patronymic_title = QLabel()
         patronymic_title.setText(FaceTab.PATRONYMIC_TITLE)
         self.grid.addWidget(patronymic_title, *positions[1][0])
         self.patronymic = QLineEdit()
-        self.patronymic.setText(self.face.get('patronymic'))
+        self.patronymic.setText(self.face['cob']['patronymic'])
         self.grid.addWidget(self.patronymic, *positions[1][1])
 
         surname_title = QLabel()
         surname_title.setText(FaceTab.SURNAME_TITLE)
         self.grid.addWidget(surname_title, *positions[2][0])
         self.surname = QLineEdit()
-        self.surname.setText(self.face.get('surname'))
+        self.surname.setText(self.face['cob']['surname'])
         self.grid.addWidget(self.surname, *positions[2][1])
 
         passport_title = QLabel()
         passport_title.setText(FaceTab.PASSPORT_TITLE)
         self.grid.addWidget(passport_title, *positions[3][0])
         self.passport = QLineEdit()
-        self.passport.setText(self.face.get('passport'))
+        self.passport.setText(self.face['cob']['passport'])
         self.grid.addWidget(self.passport, *positions[3][1])
 
         phone_num_title = QLabel()
         phone_num_title.setText(FaceTab.PHONE_NUM_TITLE)
         self.grid.addWidget(phone_num_title, *positions[4][0])
         self.phone_num = QLineEdit()
-        self.phone_num.setText(self.face.get('phone_num'))
+        self.phone_num.setText(self.face['cob']['phone_num'])
         self.grid.addWidget(self.phone_num, *positions[4][1])
 
         self.delete_btn = QPushButton('delete', self)
@@ -139,8 +126,107 @@ class FaceTab(QWidget):
             self.parent.setTabText(w.index, str(w.index))
 
 
+class MainWindow(QMainWindow):
+    def __init__(self, app: QApplication, mq: janus.Queue, app_name: str,
+                 static_path: str, width_coef: float, height_coef: float, guide_text: str):
+        super().__init__()
+
+        self.app = app
+        self.mq = mq
+        self.app_name = app_name
+        self.static_path = static_path
+        self.width_coef = width_coef
+        self.height_coef = height_coef
+        screen = self.app.primaryScreen()
+        screen_size = screen.size()
+        self.w_size = (int(screen_size.width() * self.width_coef), int(screen_size.height() * self.height_coef))
+        self.info_widget = InfoWidget(os.path.join(static_path, 'logo', 'logo.png'), self.w_size, guide_text)
+        self.user_trigger = UserTrigger()
+        self.user_trigger.sig.connect(self.user_trigger_cb)
+        self.sub_windows = {}
+        self.__init_main_window()
+
+    def __init_main_window(self):
+        self.resize(*self.w_size)
+        self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+        self.setWindowTitle(self.app_name)
+        self.setWindowIcon(QIcon(os.path.join(self.static_path, 'logo', 'logo.png')))
+
+        quit_action = QAction(QIcon(os.path.join(self.static_path, 'icons', 'quit.png')),
+                              'Quit ControlPanel.', self)
+        quit_action.setShortcut('Ctrl+Q')
+        quit_action.triggered.connect(self.__quit_action_started)
+        self.quit_action = quit_action
+        self.toolbar = self.addToolBar('Quit')
+        self.toolbar.addAction(self.quit_action)
+
+        upload_action = QAction(QIcon(os.path.join(self.static_path, 'icons', 'upload.png')),
+                                'Upload new FaceData to FaceDB.', self)
+        upload_action.triggered.connect(self.__upload_action_started)
+        upload_action.setShortcut('Ctrl+U')
+        self.upload_action = upload_action
+        self.toolbar = self.addToolBar('Upload')
+        self.toolbar.addAction(self.upload_action)
+
+        self.setCentralWidget(self.info_widget)
+        self.show()
+
+    def __quit_action_started(self):
+        if len(self.sub_windows) != 0:
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""You can't quit window, because<br>There are active connections.""")
+            warn.exec_()
+        else:
+            self.app.exit()
+
+    def __upload_action_started(self):
+        dname = QFileDialog.getExistingDirectory(self, 'Choose dir', str(Path.home()))
+        if not os.path.isdir(dname):
+            return
+        fnames = [fname for fname in os.listdir(dname) if os.path.isfile(os.path.join(dname, fname))]
+        print(fnames)
+
+    def closeEvent(self, event):
+        if len(self.sub_windows) != 0:
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""You can't quit window, because<br>There are active connections.""")
+            warn.exec_()
+            event.ignore()
+        else:
+            event.accept()
+            self.app.exit()
+
+    def user_trigger_cb(self):
+        p = self.mq.sync_q.get()
+        msg = p[0]
+        outmq = p[1]
+
+        headers = msg.get('headers')
+
+        id = msg.get('id')
+
+        b64_img_buff = msg.get('img_buff')
+        img_buff = b64decode(b64_img_buff)
+        buff = BytesIO()
+        buff.write(img_buff)
+        pix_map = QPixmap()
+        pix_map.loadFromData(buff.getvalue())
+
+        faces_data = msg.get('faces_data')
+
+        cur_time = clock()
+        nw = NotificationWindow('NW', headers, id, pix_map, faces_data, outmq, cur_time, self)
+        self.sub_windows[cur_time] = nw
+        nw.show()
+
+
 class NotificationWindow(QWidget):
-    def __init__(self, win_name: str, headers, id, pix_map: QPixmap, faces_data, outmq: Queue):
+    def __init__(self, win_name: str, headers, id, pix_map: QPixmap, faces_data,
+                 outmq: janus.Queue, ts: float, parent: MainWindow):
         super().__init__()
         self.win_name = win_name
         self.headers = headers
@@ -148,6 +234,8 @@ class NotificationWindow(QWidget):
         self.pix_map = pix_map
         self.faces_data = faces_data
         self.outmq = outmq
+        self.ts = ts
+        self.parent = parent
         self.__init_notification_window()
 
     def __init_notification_window(self):
@@ -196,21 +284,28 @@ class NotificationWindow(QWidget):
         self.grid.addWidget(self.faces_widget, 4, 1)
 
     def save_data_btn_clicked(self):
-        fname = QFileDialog.getSaveFileName(self, 'Save data', '/home/mikhail/')[0]
-        img_name = fname + '.png'
+        dname = QFileDialog.getSaveFileName(self, 'Save data', str(Path.home()))[0]
+        if os.path.exists(dname):
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""Choose non-existing folder.""")
+            return
+        os.mkdir(dname)
+        img_name = os.path.join(dname, 'img.png')
         self.pix_map.save(img_name)
-        data_name = fname + '.json'
+        data_name = os.path.join(dname, 'faces.json')
         with open(data_name, 'w') as out:
             json.dump({'faces_data': self.faces_data}, out,
                       ensure_ascii=False, indent=4, sort_keys=True)
 
     def update_faces_data(self):
         for i in range(len(self.faces_data)):
-            self.faces_data[i]['name'] = self.faces_widget.widget(i).name.text()
-            self.faces_data[i]['patronymic'] = self.faces_widget.widget(i).patronymic.text()
-            self.faces_data[i]['surname'] = self.faces_widget.widget(i).surname.text()
-            self.faces_data[i]['passport'] = self.faces_widget.widget(i).passport.text()
-            self.faces_data[i]['phone_num'] = self.faces_widget.widget(i).phone_num.text()
+            self.faces_data[i]['cob']['name'] = self.faces_widget.widget(i).name.text()
+            self.faces_data[i]['cob']['patronymic'] = self.faces_widget.widget(i).patronymic.text()
+            self.faces_data[i]['cob']['surname'] = self.faces_widget.widget(i).surname.text()
+            self.faces_data[i]['cob']['passport'] = self.faces_widget.widget(i).passport.text()
+            self.faces_data[i]['cob']['phone_num'] = self.faces_widget.widget(i).phone_num.text()
 
     def submit_btn_clicked(self):
         self.submit_btn.setChecked(True)
@@ -226,13 +321,13 @@ class NotificationWindow(QWidget):
             'id': self.id,
             'faces_data': self.faces_data
         }
-        print(self.faces_data)
-        self.outmq.put(msg)
+        self.outmq.sync_q.put(msg)
+        self.parent.sub_windows.pop(self.ts)
 
     def recognize_again_btn_clicked(self):
         self.recognize_again_btn.setChecked(True)
         if not self.recognize_again_btn.first_time or \
-                self.recognize_again_btn.isChecked() or \
+                self.submit_btn.isChecked() or \
                 self.cancel_btn.isChecked():
             return
         self.recognize_again_btn.first_time = False
@@ -243,13 +338,14 @@ class NotificationWindow(QWidget):
             'id': self.id,
             'faces_data': self.faces_data
         }
-        self.outmq.put(msg)
+        self.outmq.sync_q.put(msg)
+        self.parent.sub_windows.pop(self.ts)
 
     def cancel_btn_clicked(self):
         self.cancel_btn.setChecked(True)
         if not self.cancel_btn.first_time or \
-                self.recognize_again_btn.isChecked() or \
-                self.cancel_btn.isChecked():
+                self.submit_btn.isChecked() or \
+                self.recognize_again_btn.isChecked():
             return
         self.cancel_btn.first_time = False
         msg = {
@@ -257,18 +353,22 @@ class NotificationWindow(QWidget):
             'cmd': 'cancel',
             'id': self.id
         }
-        self.outmq.put(msg)
+        self.outmq.sync_q.put(msg)
+        self.parent.sub_windows.pop(self.ts)
 
     def closeEvent(self, event):
-        reply = QMessageBox.question(self, 'Message', "Are you sure to quit?", QMessageBox.Yes | QMessageBox.No,
-                                     QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            event.accept()
-        else:
+        if self.submit_btn.first_time and \
+                self.recognize_again_btn.first_time and \
+                self.cancel_btn.first_time:
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""You can't quit window without pressing<br>
+            'submit', 'recognize again' or 'cancel' button.""")
+            warn.exec_()
             event.ignore()
-
-    def run(self):
-        self.show()
+        else:
+            event.accept()
 
 
 class Painter(QWidget):
@@ -318,11 +418,15 @@ class Painter(QWidget):
                 else self.released_coords.x()
             self.faces_data.append({
                 'box': [top, right, bottom, left],
-                'name': '',
-                'patronymic': '',
-                'surname': '',
-                'passport': '',
-                'phone_num': ''
+                'cob': {
+                    'id': '-',
+                    'name': '-',
+                    'patronymic': '-',
+                    'surname': '-',
+                    'passport': '-',
+                    'sex': '-',
+                    'phone_num': '-'
+                }
             })
             face_tab = FaceTab(len(self.faces_data) - 1, self.faces_data[-1], self.parent.faces_widget)
             self.parent.faces_widget.addTab(face_tab, str(face_tab.index))
@@ -356,34 +460,14 @@ class Painter(QWidget):
             self.cur_box = None
 
 
-class GUI(QWidget):
-    def __init__(self, app: QApplication, mq: Queue, app_name: str,
-                 logo_path: str, width_coef: float, height_coef: float, guide_text: str):
+class InfoWidget(QWidget):
+    def __init__(self, logo_path: str, w_size, guide_text: str):
         super().__init__()
-        self.app = app
-        self.mq = mq
-        self.app_name = app_name
         self.logo_path = logo_path
-        self.height_coef = height_coef
-        self.width_coef = width_coef
         self.guide_text = guide_text
-        self.msg_trigger = MsgTrigger()
-        self.msg_trigger.sig.connect(self.msg_trigger_cb)
-        self.sub_windows = []
-        self.__init_main_window()
+        self.__init_main_widget(w_size)
 
-    def __init_main_window(self):
-        screen = self.app.primaryScreen()
-        screen_size = screen.size()
-        app_size = (int(screen_size.width() * self.width_coef),
-                    int(screen_size.height() * self.height_coef))
-        app_width = app_size[0]
-        app_height = app_size[1]
-        self.resize(app_width, app_height)
-        self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
-        self.setWindowTitle(self.app_name)
-        self.setWindowIcon(QIcon(self.logo_path))
-
+    def __init_main_widget(self, w_size):
         self.grid = QGridLayout()
         self.setLayout(self.grid)
         positions = [(0, 0), (1, 0)]
@@ -391,96 +475,166 @@ class GUI(QWidget):
         logo = QLabel()
         logo.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         pix_map = QPixmap(self.logo_path)
+        sh = int(w_size[0] * 0.5)
+        pix_map.scaledToHeight(sh)
         logo.setPixmap(pix_map)
-        self.grid.addWidget(logo, *positions[0])
+        self.logo = logo
+        self.grid.addWidget(self.logo, *positions[0])
 
         guide = QLabel()
         guide.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         guide.setOpenExternalLinks(True)
+        guide.setWordWrap(True)
         guide.setText(self.guide_text)
-        self.grid.addWidget(guide, *positions[1])
+        self.guide = guide
+        self.grid.addWidget(self.guide, *positions[1])
 
-    def msg_trigger_cb(self):
-        p = self.mq.get()
-        msg = p[0]
-        outmq = p[1]
 
-        headers = msg.get('headers')
+class GUI:
+    APP_NAME = 'ControlPanel'
+    STATIC_PATH = '../static/'
+    WIDTH_COEF = 0.5
+    HEIGHT_COEF = 0.5
+    GUIDE_TEXT = '''
+    Welcome to <a href='https://github.com/nofacedb/controlpanel'>ControlPanel</a>,
+    one component of the <a href='https://github.com/nofacedb'>NoFaceDB</a> project.
+    <br><br>
+    ControlPanel starts HTTP-server on address, specified by yaml configuration file, and<br>
+    handles notifications from FaceDB module. After getting notification ControlPanel<br>
+    creates new subwindow with image and faces information from it and then You can<br>
+    check if faces are recognized correctly.
+    <br><br>
+    This is ControlPanel 0.1 (build 1, PyQT5 Version 12.1+) of 2019-05-02
+    <br><br>
+    Copyright (C) Mikhail Masyagin 2019
+    '''
 
-        id = msg.get('id')
+    def __init__(self, mq: janus.Queue):
+        self.main_window = MainWindow()
+        app = QApplication(sys.argv)
+        self.app = app
+        self.mq = mq
+        self.main_window = MainWindow(self.app, self.mq, GUI.APP_NAME, GUI.STATIC_PATH,
+                                      GUI.WIDTH_COEF, GUI.HEIGHT_COEF, GUI.GUIDE_TEXT)
 
-        b64_img_buff = msg.get('img_buff')
-        img_buff = b64decode(b64_img_buff)
-        buff = BytesIO()
-        buff.write(img_buff)
-        pix_map = QPixmap()
-        pix_map.loadFromData(buff.getvalue())
-
-        faces_data = msg.get('faces_data')
-
-        nw = NotificationWindow('NW', headers, id, pix_map, faces_data, outmq)
-        self.sub_windows.append(nw)
-        nw.run()
-
-    def run(self):
-        self.show()
+    def show(self):
         self.app.exec_()
 
 
-class AppCtx:
-    def __init__(self, immed_resp: bool, gui: GUI, loop: asyncio.BaseEventLoop):
-        self.immed_resp = immed_resp
-        self.gui = gui
-        self.loop = loop
+class HTTPServerCFG:
+    def __init__(self, cfg: dict):
+        self.name = cfg['name']
+        self.socket = cfg['socket']
+        self.write_timeout_ms = cfg['write_timeout_ms']
+        self.read_timeout_ms = cfg['read_timeout_ms']
+        self.immed_resp = cfg['immed_resp']
+        self.req_max_size = cfg['req_max_size']
+        self.key_path = cfg['key_path']
+        self.crt_path = cfg['crt_path']
 
-    async def handler(self, req: web.Request) -> web.Response:
-        print('kek')
-        msg = await req.json()
-        outmq = Queue()
+
+class CFG:
+    def __init__(self, fcfg: dict):
+        self.http_server_cfg = HTTPServerCFG(fcfg['http_server'])
+
+
+class HTTPServer:
+    """HTTPServer class handles notifications about processed images."""
+
+    STATUS_BAD_REQUEST = 400
+    STATUS_INTERNAL_SERVER_ERROR = 500
+
+    API_V1_NOTIFY_IMG = '/api/v1/notify_img'
+    API_V1_CONFIRM_IMG = '/api/v1/confirm_img'
+
+    def __init__(self, cfg: CFG, loop: asyncio.BaseEventLoop, gui: GUI, mq: janus.Queue):
+        self.cfg = cfg
+        app = web.Application(client_max_size=self.cfg.http_server_cfg.req_max_size)
+        app.add_routes([web.put(HTTPServer.API_V1_NOTIFY_IMG, self.notify_img_handler),
+                        web.put(HTTPServer.API_V1_CONFIRM_IMG, self.confirm_img_handler)])
+        self.app = app
+        if self.cfg.http_server_cfg.key_path != '' and self.cfg.http_server_cfg.crt_path != '':
+            self.src_addr = 'https://' + self.cfg.http_server_cfg.name
+        else:
+            self.src_addr = 'http://' + self.cfg.http_server_cfg.name
+
+        self.loop = loop
+        self.gui = gui
+        self.mq = mq
+
+    def run(self):
+        asyncio.set_event_loop(self.loop)
+        runner = self.app.make_handler()
+
+        conn_str = self.cfg.http_server_cfg.socket
+        is_ip_port = match(r'(\d)+\.(\d)+\.(\d)+\.(\d)+:(\d)+', conn_str) is not None
+        if self.cfg.http_server_cfg.crt_path != '' and self.cfg.http_server_cfg.key_path != '':
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(self.cfg.http_server_cfg.crt_path,
+                                        self.cfg.http_server_cfg.key_path)
+        else:
+            ssl_context = None
+        if is_ip_port:
+            conn_data = conn_str.split(':')
+            host = conn_data[0]
+            port = int(conn_data[1])
+            if ssl_context is not None:
+                srv = self.loop.create_server(runner, host=host, port=port, ssl=ssl_context)
+            else:
+                srv = self.loop.create_server(runner, host=host, port=port, ssl=ssl_context)
+        else:
+            path = conn_str
+            if ssl_context is not None:
+                srv = self.loop.create_unix_connection(runner, path, ssl=ssl_context)
+            else:
+                srv = self.loop.create_unix_connection(runner, path, ssl=ssl_context)
+
+        self.loop.run_until_complete(srv)
+        self.loop.run_forever()
+
+    RESP_API_V1_PUT_CONTROL = '/api/v1/put_control'
+
+    async def notify_img_handler(self, req: web.Request) -> web.Response:
+        try:
+            body = await req.json()
+            headers = body['headers']
+            addr = headers['src_addr']
+            req_id = body['id']
+            b64_img_buff = body['img_buff']
+            faces = body['faces']
+        except KeyError:
+            return web.json_response({
+                'headers': {'src_addr': self.src_addr, 'immed': False},
+                'id': req_id,
+                'error': True,
+                'error_info': 'invalid request data'
+            }, status=HTTPServer.STATUS_BAD_REQUEST)
+
+        msg = body
+        outmq = janus.Queue(loop=self.loop)
         p = (msg, outmq)
-        if self.immed_resp:
-            self.gui.mq.put(p)
-            self.gui.msg_trigger.sig.emit()
-            asyncio.run_coroutine_threadsafe(self.create_response(outmq), loop=self.loop)
+        self.gui.mq.sync_q.put(p)
+        self.gui.user_trigger.sig.emit()
+        if self.cfg.http_server_cfg.immed_resp:
+            asyncio.run_coroutine_threadsafe(self.notify_img_create_resp(outmq), loop=self.loop)
             return web.json_response({'headers': {'src_addr': '', 'immed': True}})
 
-        self.gui.mq.put(p)
-        msg = outmq.get()
+        msg = await outmq.async_q.get()
         return web.json_response(msg)
 
-    async def create_response(self, outmq: Queue):
-        msg = outmq.get()
+    async def notify_img_create_resp(self, outmq: janus.Queue):
+        data = await outmq.async_q.get()
+        addr = data[0]
+        msg = data[1]
         async with ClientSession(
                 json_serialize=json.dumps) as session:
-            await session.put('http://127.0.0.1:10000' + '/api/v1/put_control', json=msg)
+            await session.put(addr + HTTPServer.RESP_API_V1_PUT_CONTROL, json=msg)
 
+    async def confirm_img_handler(self, req: web.Request) -> web.Response:
+        pass
 
-def server(args, loop: asyncio.BaseEventLoop, gui: GUI) -> int:
-    asyncio.set_event_loop(loop)
-    """server_face_recognition starts asynchronous face recognition server"""
-    app = web.Application(client_max_size=args.reqmaxsize)
-    app_ctx = AppCtx(args.immedresp, gui, loop)
-    app.add_routes([web.put('/', app_ctx.handler)])
-    # Well, I know that make_handler method is deprecated, but
-    # aiohttp documentation sucks, so I can't understand how to use
-    # AppRunner API.
-    runner = app.make_handler()
-
-    conn_str = args.socket
-    is_ip_port = match(r'(\d)+\.(\d)+\.(\d)+\.(\d)+:(\d)+', conn_str) is not None
-    if is_ip_port:
-        conn_data = conn_str.split(':')
-        host = conn_data[0]
-        port = int(conn_data[1])
-        srv = loop.create_server(runner, host=host, port=port)
-    else:
-        path = conn_str
-        srv = loop.create_unix_connection(runner, path)
-
-    loop.run_until_complete(srv)
-    loop.run_forever()
-
-    return 0
+    async def confirm_img_create_resp(self):
+        pass
 
 
 DESC_STR = r"""FaceRecognition is a simple script, that finds all faces in image
@@ -489,21 +643,12 @@ and returns their coordinates and features vectors.
 
 
 def parse_args():
-    """parse_args parses all command line arguments"""
     parser = argparse.ArgumentParser(prog='FaceRecognition',
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      description=DESC_STR)
     parser.add_argument('-v', '--version', action='version', version='%(prog)s v0.1')
     parser.add_argument('-c', '--config', type=str, default='',
                         help='path to yaml config file')
-    parser.add_argument('-s', '--socket', type=str, default='',
-                        help='IP:PORT or path to UNIX-Socket')
-    parser.add_argument('--immedresp', action='store_true',
-                        help='specifies, if server should return answer immediately')
-    parser.add_argument('--reqmaxsize', type=int, default=1024 ** 2,
-                        help='client request max size in bytes (default: %(default)s))')
-    parser.add_argument('-i', '--input', type=str, default='',
-                        help='path to input image')
 
     args = parser.parse_args()
 
@@ -512,14 +657,18 @@ def parse_args():
 
 def main():
     args = parse_args()
+    with open(args.config, 'r') as stream:
+        fcfg = yaml.safe_load(stream)
+        cfg = CFG(fcfg)
+
     loop = asyncio.new_event_loop()
-    app = QApplication(sys.argv)
-    mq = Queue()
-    gui = GUI(app, mq, APP_NAME, LOGO_PATH, WIDTH_COEF, HEIGHT_COEF, GUIDE_TEXT)
-    t = threading.Thread(target=server, name='server', args=(args, loop, gui))
+    mq = janus.Queue(loop=loop)
+    gui = GUI(mq)
+    http_server = HTTPServer(cfg, loop, gui)
+    t = threading.Thread(target=http_server.run, name='http_server')
+    t.daemon = True
     t.start()
-    gui.run()
-    t.join()
+    gui.show()
 
 
 if __name__ == '__main__':
