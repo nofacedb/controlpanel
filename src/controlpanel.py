@@ -8,15 +8,15 @@ import os
 import ssl
 import sys
 import threading
-from base64 import b64decode
+from base64 import b64decode, b64encode
 from io import BytesIO
 from pathlib import Path
 from re import match
 from time import clock
-
+from PIL import Image
 import janus
 import yaml
-from PyQt5 import QtGui
+from PyQt5 import QtGui, QtNetwork, QtCore
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QRect, QPoint
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QPainter, QPaintEvent, QPen, QMouseEvent
 from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QLabel, QLineEdit, QTabWidget, QPushButton, QMessageBox, \
@@ -128,29 +128,42 @@ class FaceTab(QWidget):
 
 class MainWindow(QMainWindow):
     def __init__(self, app: QApplication, mq: janus.Queue, app_name: str,
-                 static_path: str, width_coef: float, height_coef: float, guide_text: str):
+                 static_path: str, width_coef: float, height_coef: float, guide_text: str, src_addr: str,
+                 facedb_addr: str):
         super().__init__()
 
         self.app = app
         self.mq = mq
+
         self.app_name = app_name
         self.static_path = static_path
         self.width_coef = width_coef
         self.height_coef = height_coef
+
         screen = self.app.primaryScreen()
         screen_size = screen.size()
         self.w_size = (int(screen_size.width() * self.width_coef), int(screen_size.height() * self.height_coef))
+
         self.info_widget = InfoWidget(os.path.join(static_path, 'logo', 'logo.png'), self.w_size, guide_text)
+
+        self.src_addr = src_addr
+        self.facedb_addr = facedb_addr
+
         self.user_trigger = UserTrigger()
         self.user_trigger.sig.connect(self.user_trigger_cb)
         self.sub_windows = {}
         self.__init_main_window()
+
+        self.face_id = 0
 
     def __init_main_window(self):
         self.resize(*self.w_size)
         self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
         self.setWindowTitle(self.app_name)
         self.setWindowIcon(QIcon(os.path.join(self.static_path, 'logo', 'logo.png')))
+
+        self.network_manager = QtNetwork.QNetworkAccessManager()
+        self.network_manager.finished.connect(self.handle_response)
 
         quit_action = QAction(QIcon(os.path.join(self.static_path, 'icons', 'quit.png')),
                               'Quit ControlPanel.', self)
@@ -168,6 +181,14 @@ class MainWindow(QMainWindow):
         self.toolbar = self.addToolBar('Upload')
         self.toolbar.addAction(self.upload_action)
 
+        find_action = QAction(QIcon(os.path.join(self.static_path, 'icons', 'find.png')),
+                              'Find human by face.', self)
+        find_action.triggered.connect(self.__find_action_started)
+        find_action.setShortcut('Ctrl+F')
+        self.find_action = find_action
+        self.toolbar = self.addToolBar('Find')
+        self.toolbar.addAction(self.find_action)
+
         self.setCentralWidget(self.info_widget)
         self.show()
 
@@ -181,12 +202,116 @@ class MainWindow(QMainWindow):
         else:
             self.app.exit()
 
+    REQ_API_V1_PUT_IMG = '/api/v1/put_img'
+
+    def __find_action_started(self):
+        fname = QFileDialog.getOpenFileName(self, 'Choose image', str(Path.home()))[0]
+        if not os.path.isfile(fname):
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""You should choose image.""")
+            warn.exec_()
+            return
+
+        url = self.facedb_addr + MainWindow.REQ_API_V1_PUT_IMG
+        req = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
+        req.setHeader(QtNetwork.QNetworkRequest.ContentTypeHeader,
+                      'application/json')
+        img = Image.open(fname)
+        bytes_io = BytesIO()
+        img.save(bytes_io, format='PNG')
+        img_buff = bytes_io.getvalue()
+        b64_img_buff = str(b64encode(img_buff))
+        b64_img_buff = b64_img_buff[2:len(b64_img_buff) - 1]
+        json_data = {
+            'headers': {'src_addr': self.src_addr, 'immed': False},
+            'img_buff': b64_img_buff,
+        }
+        req_data = QtCore.QByteArray()
+        req_data.append(json.dumps(json_data, ensure_ascii=False))
+        self.network_manager.put(req, req_data)
+
+    REQ_API_V1_ADD_FACE = '/api/v1/add_face'
+
     def __upload_action_started(self):
         dname = QFileDialog.getExistingDirectory(self, 'Choose dir', str(Path.home()))
         if not os.path.isdir(dname):
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""You should choose dir.""")
+            warn.exec_()
             return
         fnames = [fname for fname in os.listdir(dname) if os.path.isfile(os.path.join(dname, fname))]
-        print(fnames)
+        data_name = ''
+        imgs_names = []
+        for fname in fnames:
+            if fname.endswith('.json') and data_name == '':
+                data_name = os.path.join(dname, fname)
+            elif fname.endswith('.json'):
+                warn = QMessageBox()
+                warn.setStandardButtons(QMessageBox.Ok)
+                warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+                warn.setText("""Found more than one data file.""")
+                warn.exec_()
+                return
+            else:
+                imgs_names.append(os.path.join(dname, fname))
+        if data_name == '':
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""No data file found.""")
+            warn.exec_()
+            return
+
+        face_id = self.face_id
+        self.face_id += 1
+
+        url = self.facedb_addr + MainWindow.REQ_API_V1_ADD_FACE
+
+        # Send JSON data.
+        req = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
+        req.setHeader(QtNetwork.QNetworkRequest.ContentTypeHeader,
+                      'application/json')
+        with open(data_name) as f:
+            data = json.load(f)
+        data['id'] = '-'
+        json_data = {
+            'headers': {'src_addr': self.src_addr, 'immed': False},
+            'id': face_id,
+            'cob': data,
+            'imgs_number': len(imgs_names)
+        }
+        req_data = QtCore.QByteArray()
+        req_data.append(json.dumps(json_data, ensure_ascii=False))
+        self.network_manager.post(req, req_data)
+
+        # Send all images.
+        for img_name in imgs_names:
+            req = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
+            req.setHeader(QtNetwork.QNetworkRequest.ContentTypeHeader,
+                          'application/json')
+            with open(img_name, "rb") as f:
+                img_buff = f.read()
+                b64_img_buff = str(b64encode(img_buff))
+                b64_img_buff = b64_img_buff[2:len(b64_img_buff) - 1]
+            json_data = {
+                'headers': {'src_addr': self.src_addr, 'immed': False},
+                'id': face_id,
+                'img_buff': b64_img_buff,
+            }
+            req_data = QtCore.QByteArray()
+            req_data.append(json.dumps(json_data, ensure_ascii=False))
+            self.network_manager.post(req, req_data)
+
+    def handle_response(self, reply: QtNetwork.QNetworkReply):
+        er = reply.error()
+        if er == QtNetwork.QNetworkReply.NoError:
+            print('ok')
+        else:
+            print('error')
 
     def closeEvent(self, event):
         if len(self.sub_windows) != 0:
@@ -492,7 +617,7 @@ class InfoWidget(QWidget):
 
 class GUI:
     APP_NAME = 'ControlPanel'
-    STATIC_PATH = '../static/'
+    STATIC_PATH = '/home/mikhail/Python/controlpanel/static/'
     WIDTH_COEF = 0.5
     HEIGHT_COEF = 0.5
     GUIDE_TEXT = '''
@@ -509,13 +634,17 @@ class GUI:
     Copyright (C) Mikhail Masyagin 2019
     '''
 
-    def __init__(self, mq: janus.Queue):
-        self.main_window = MainWindow()
+    def __init__(self, mq: janus.Queue, src_addr: str, facedb_addr: str):
         app = QApplication(sys.argv)
         self.app = app
         self.mq = mq
         self.main_window = MainWindow(self.app, self.mq, GUI.APP_NAME, GUI.STATIC_PATH,
-                                      GUI.WIDTH_COEF, GUI.HEIGHT_COEF, GUI.GUIDE_TEXT)
+                                      GUI.WIDTH_COEF, GUI.HEIGHT_COEF, GUI.GUIDE_TEXT, src_addr, facedb_addr)
+        self.facedb_addr = facedb_addr
+        self.src_addr = src_addr
+
+    def notify_gui(self):
+        self.main_window.user_trigger.sig.emit()
 
     def show(self):
         self.app.exec_()
@@ -533,9 +662,15 @@ class HTTPServerCFG:
         self.crt_path = cfg['crt_path']
 
 
+class FaceDBCFG:
+    def __init__(self, cfg: dict):
+        self.addr = cfg['addr']
+
+
 class CFG:
     def __init__(self, fcfg: dict):
         self.http_server_cfg = HTTPServerCFG(fcfg['http_server'])
+        self.facedb_cfg = FaceDBCFG(fcfg['facedb'])
 
 
 class HTTPServer:
@@ -547,7 +682,7 @@ class HTTPServer:
     API_V1_NOTIFY_IMG = '/api/v1/notify_img'
     API_V1_CONFIRM_IMG = '/api/v1/confirm_img'
 
-    def __init__(self, cfg: CFG, loop: asyncio.BaseEventLoop, gui: GUI, mq: janus.Queue):
+    def __init__(self, cfg: CFG, loop: asyncio.BaseEventLoop, gui: GUI):
         self.cfg = cfg
         app = web.Application(client_max_size=self.cfg.http_server_cfg.req_max_size)
         app.add_routes([web.put(HTTPServer.API_V1_NOTIFY_IMG, self.notify_img_handler),
@@ -560,7 +695,6 @@ class HTTPServer:
 
         self.loop = loop
         self.gui = gui
-        self.mq = mq
 
     def run(self):
         asyncio.set_event_loop(self.loop)
@@ -601,7 +735,7 @@ class HTTPServer:
             addr = headers['src_addr']
             req_id = body['id']
             b64_img_buff = body['img_buff']
-            faces = body['faces']
+            faces = body['faces_data']
         except KeyError:
             return web.json_response({
                 'headers': {'src_addr': self.src_addr, 'immed': False},
@@ -614,7 +748,7 @@ class HTTPServer:
         outmq = janus.Queue(loop=self.loop)
         p = (msg, outmq)
         self.gui.mq.sync_q.put(p)
-        self.gui.user_trigger.sig.emit()
+        self.gui.notify_gui()
         if self.cfg.http_server_cfg.immed_resp:
             asyncio.run_coroutine_threadsafe(self.notify_img_create_resp(outmq), loop=self.loop)
             return web.json_response({'headers': {'src_addr': '', 'immed': True}})
@@ -663,7 +797,8 @@ def main():
 
     loop = asyncio.new_event_loop()
     mq = janus.Queue(loop=loop)
-    gui = GUI(mq)
+    src_addr = 'http://' + cfg.http_server_cfg.socket
+    gui = GUI(mq, src_addr, cfg.facedb_cfg.addr)
     http_server = HTTPServer(cfg, loop, gui)
     t = threading.Thread(target=http_server.run, name='http_server')
     t.daemon = True
