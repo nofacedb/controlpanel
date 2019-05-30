@@ -8,14 +8,15 @@ import os
 import ssl
 import sys
 import threading
-from base64 import b64decode, b64encode
+import uuid
+from base64 import b64encode, b64decode
 from io import BytesIO
 from pathlib import Path
-from re import match
 from time import clock
-from PIL import Image
+
 import janus
 import yaml
+from PIL import Image
 from PyQt5 import QtGui, QtNetwork, QtCore
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QRect, QPoint
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QPainter, QPaintEvent, QPen, QMouseEvent
@@ -40,9 +41,9 @@ class FaceBox:
 
 
 class FaceTabsWidget(QTabWidget):
-    def __init__(self, faces_data):
+    def __init__(self, image_control_objects):
         super().__init__()
-        self.faces_data = faces_data
+        self.image_control_objects = image_control_objects
         self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
 
 
@@ -53,16 +54,20 @@ class PushButtonOnce(QPushButton):
 
 
 class FaceTab(QWidget):
+    PASSPORT_TITLE = 'passport'
+    SURNAME_TITLE = 'surname'
     NAME_TITLE = 'name'
     PATRONYMIC_TITLE = 'patronymic'
-    SURNAME_TITLE = 'surname'
-    PASSPORT_TITLE = 'passport'
-    PHONE_NUM_TITLE = 'phone num'
+    SEX_TITLE = 'sex'
+    BIRTHDATE_TITLE = 'birthdate'
+    PHONE_NUM_TITLE = 'phone_num'
+    EMAIL_TITLE = 'email'
+    ADDRESS_TITLE = 'address'
 
-    def __init__(self, index, face, parent: FaceTabsWidget):
+    def __init__(self, index, image_control_object, parent: FaceTabsWidget):
         super().__init__()
         self.index = index
-        self.face = face
+        self.image_control_object = image_control_object
         self.parent = parent
         self.__init_face_tab()
 
@@ -75,51 +80,83 @@ class FaceTab(QWidget):
                      ((2, 0), (2, 1)),
                      ((3, 0), (3, 1)),
                      ((4, 0), (4, 1)),
-                     (5, 0)]
-
-        name_title = QLabel()
-        name_title.setText(FaceTab.NAME_TITLE)
-        self.grid.addWidget(name_title, *positions[0][0])
-        self.name = QLineEdit()
-        self.name.setText(self.face['cob']['name'])
-        self.grid.addWidget(self.name, *positions[0][1])
-
-        patronymic_title = QLabel()
-        patronymic_title.setText(FaceTab.PATRONYMIC_TITLE)
-        self.grid.addWidget(patronymic_title, *positions[1][0])
-        self.patronymic = QLineEdit()
-        self.patronymic.setText(self.face['cob']['patronymic'])
-        self.grid.addWidget(self.patronymic, *positions[1][1])
-
-        surname_title = QLabel()
-        surname_title.setText(FaceTab.SURNAME_TITLE)
-        self.grid.addWidget(surname_title, *positions[2][0])
-        self.surname = QLineEdit()
-        self.surname.setText(self.face['cob']['surname'])
-        self.grid.addWidget(self.surname, *positions[2][1])
+                     ((5, 0), (5, 1)),
+                     ((6, 0), (6, 1)),
+                     ((7, 0), (7, 1)),
+                     ((8, 0), (8, 1)),
+                     (9, 0)]
 
         passport_title = QLabel()
         passport_title.setText(FaceTab.PASSPORT_TITLE)
-        self.grid.addWidget(passport_title, *positions[3][0])
+        self.grid.addWidget(passport_title, *positions[0][0])
         self.passport = QLineEdit()
-        self.passport.setText(self.face['cob']['passport'])
-        self.grid.addWidget(self.passport, *positions[3][1])
+        self.passport.setText(self.image_control_object['control_object']['passport'])
+        self.grid.addWidget(self.passport, *positions[0][1])
+
+        surname_title = QLabel()
+        surname_title.setText(FaceTab.SURNAME_TITLE)
+        self.grid.addWidget(surname_title, *positions[1][0])
+        self.surname = QLineEdit()
+        self.surname.setText(self.image_control_object['control_object']['surname'])
+        self.grid.addWidget(self.surname, *positions[1][1])
+
+        name_title = QLabel()
+        name_title.setText(FaceTab.NAME_TITLE)
+        self.grid.addWidget(name_title, *positions[2][0])
+        self.name = QLineEdit()
+        self.name.setText(self.image_control_object['control_object']['name'])
+        self.grid.addWidget(self.name, *positions[2][1])
+
+        patronymic_title = QLabel()
+        patronymic_title.setText(FaceTab.PATRONYMIC_TITLE)
+        self.grid.addWidget(patronymic_title, *positions[3][0])
+        self.patronymic = QLineEdit()
+        self.patronymic.setText(self.image_control_object['control_object']['patronymic'])
+        self.grid.addWidget(self.patronymic, *positions[3][1])
+
+        sex_title = QLabel()
+        sex_title.setText(FaceTab.SEX_TITLE)
+        self.grid.addWidget(sex_title, *positions[4][0])
+        self.sex = QLineEdit()
+        self.sex.setText(self.image_control_object['control_object']['sex'])
+        self.grid.addWidget(self.sex, *positions[4][1])
+
+        birthdate_title = QLabel()
+        birthdate_title.setText(FaceTab.BIRTHDATE_TITLE)
+        self.grid.addWidget(birthdate_title, *positions[5][0])
+        self.birthdate = QLineEdit()
+        self.birthdate.setText(self.image_control_object['control_object']['birthdate'])
+        self.grid.addWidget(self.birthdate, *positions[5][1])
 
         phone_num_title = QLabel()
         phone_num_title.setText(FaceTab.PHONE_NUM_TITLE)
-        self.grid.addWidget(phone_num_title, *positions[4][0])
+        self.grid.addWidget(phone_num_title, *positions[6][0])
         self.phone_num = QLineEdit()
-        self.phone_num.setText(self.face['cob']['phone_num'])
-        self.grid.addWidget(self.phone_num, *positions[4][1])
+        self.phone_num.setText(self.image_control_object['control_object']['phone_num'])
+        self.grid.addWidget(self.phone_num, *positions[6][1])
+
+        email_title = QLabel()
+        email_title.setText(FaceTab.EMAIL_TITLE)
+        self.grid.addWidget(email_title, *positions[7][0])
+        self.email = QLineEdit()
+        self.email.setText(self.image_control_object['control_object']['email'])
+        self.grid.addWidget(self.email, *positions[7][1])
+
+        address_title = QLabel()
+        address_title.setText(FaceTab.ADDRESS_TITLE)
+        self.grid.addWidget(address_title, *positions[8][0])
+        self.address = QLineEdit()
+        self.address.setText(self.image_control_object['control_object']['address'])
+        self.grid.addWidget(self.address, *positions[8][1])
 
         self.delete_btn = QPushButton('delete', self)
         self.delete_btn.setToolTip("""'delete' button removes this face from image.""")
         self.delete_btn.clicked.connect(self.delete_btn_clicked)
-        self.grid.addWidget(self.delete_btn, *positions[5])
+        self.grid.addWidget(self.delete_btn, *positions[9])
 
     def delete_btn_clicked(self):
         self.parent.removeTab(self.index)
-        del self.parent.faces_data[self.index]
+        del self.parent.image_control_objects[self.index]
         for i in range(self.index, self.parent.count()):
             w = self.parent.widget(i)
             w.index = i
@@ -202,7 +239,7 @@ class MainWindow(QMainWindow):
         else:
             self.app.exit()
 
-    REQ_API_V1_PUT_IMG = '/api/v1/put_img'
+    REQ_API_V1_PUT_IMAGE = '/api/v1/put_image'
 
     def __find_action_started(self):
         fname = QFileDialog.getOpenFileName(self, 'Choose image', str(Path.home()))[0]
@@ -214,19 +251,18 @@ class MainWindow(QMainWindow):
             warn.exec_()
             return
 
-        url = self.facedb_addr + MainWindow.REQ_API_V1_PUT_IMG
+        url = self.facedb_addr + MainWindow.REQ_API_V1_PUT_IMAGE
         req = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
         req.setHeader(QtNetwork.QNetworkRequest.ContentTypeHeader,
                       'application/json')
         img = Image.open(fname)
         bytes_io = BytesIO()
         img.save(bytes_io, format='PNG')
-        img_buff = bytes_io.getvalue()
-        b64_img_buff = str(b64encode(img_buff))
-        b64_img_buff = b64_img_buff[2:len(b64_img_buff) - 1]
+        img_buff = str(b64encode(bytes_io.getvalue()))
+        img_buff = img_buff[2:len(img_buff) - 1]
         json_data = {
-            'headers': {'src_addr': self.src_addr, 'immed': False},
-            'img_buff': b64_img_buff,
+            'header': {'src_addr': self.src_addr, 'uuid': str(uuid.uuid4())},
+            'img_buff': img_buff,
         }
         req_data = QtCore.QByteArray()
         req_data.append(json.dumps(json_data, ensure_ascii=False))
@@ -279,7 +315,7 @@ class MainWindow(QMainWindow):
             data = json.load(f)
         data['id'] = '-'
         json_data = {
-            'headers': {'src_addr': self.src_addr, 'immed': False},
+            'header': {'src_addr': self.src_addr, 'immed': False},
             'id': face_id,
             'cob': data,
             'imgs_number': len(imgs_names)
@@ -298,7 +334,7 @@ class MainWindow(QMainWindow):
                 b64_img_buff = str(b64encode(img_buff))
                 b64_img_buff = b64_img_buff[2:len(b64_img_buff) - 1]
             json_data = {
-                'headers': {'src_addr': self.src_addr, 'immed': False},
+                'header': {'src_addr': self.src_addr, 'immed': False},
                 'id': face_id,
                 'img_buff': b64_img_buff,
             }
@@ -330,34 +366,37 @@ class MainWindow(QMainWindow):
         msg = p[0]
         outmq = p[1]
 
-        headers = msg.get('headers')
+        header = msg.get('header')
 
-        id = msg.get('id')
+        uuid = header.get('uuid')
 
-        b64_img_buff = msg.get('img_buff')
-        img_buff = b64decode(b64_img_buff)
+        img_buff = msg.get('img_buff')
+        img_buff = b64decode(img_buff)
         buff = BytesIO()
         buff.write(img_buff)
+        img_buff = buff
         pix_map = QPixmap()
-        pix_map.loadFromData(buff.getvalue())
+        pix_map.loadFromData(img_buff.getvalue())
 
-        faces_data = msg.get('faces_data')
+        image_control_objects = msg.get('image_control_objects')
 
         cur_time = clock()
-        nw = NotificationWindow('NW', headers, id, pix_map, faces_data, outmq, cur_time, self)
+        nw = NotificationWindow(self.src_addr, 'NW', header, uuid, pix_map, image_control_objects, outmq, cur_time,
+                                self)
         self.sub_windows[cur_time] = nw
         nw.show()
 
 
 class NotificationWindow(QWidget):
-    def __init__(self, win_name: str, headers, id, pix_map: QPixmap, faces_data,
+    def __init__(self, src_addr, win_name: str, header, uuid, pix_map: QPixmap, image_control_objects,
                  outmq: janus.Queue, ts: float, parent: MainWindow):
         super().__init__()
+        self.src_addr = src_addr
         self.win_name = win_name
-        self.headers = headers
-        self.id = id
+        self.header = header
+        self.uuid = uuid
         self.pix_map = pix_map
-        self.faces_data = faces_data
+        self.image_control_objects = image_control_objects
         self.outmq = outmq
         self.ts = ts
         self.parent = parent
@@ -371,7 +410,7 @@ class NotificationWindow(QWidget):
         self.grid = QGridLayout()
         self.setLayout(self.grid)
 
-        self.drawing_area = Painter(self.pix_map, self.faces_data, self)
+        self.drawing_area = Painter(self.pix_map, self.image_control_objects, self)
         self.grid.addWidget(self.drawing_area, 0, 0, 5, 1)
 
         self.submit_btn = PushButtonOnce('submit', self)
@@ -402,9 +441,9 @@ class NotificationWindow(QWidget):
         self.save_data_btn.clicked.connect(self.save_data_btn_clicked)
         self.grid.addWidget(self.save_data_btn, 3, 1)
 
-        self.faces_widget = FaceTabsWidget(self.faces_data)
-        for i in range(len(self.faces_data)):
-            face_tab = FaceTab(i, self.faces_data[i], self.faces_widget)
+        self.faces_widget = FaceTabsWidget(self.image_control_objects)
+        for i in range(len(self.image_control_objects)):
+            face_tab = FaceTab(i, self.image_control_objects[i], self.faces_widget)
             self.faces_widget.addTab(face_tab, str(face_tab.index))
         self.grid.addWidget(self.faces_widget, 4, 1)
 
@@ -421,16 +460,21 @@ class NotificationWindow(QWidget):
         self.pix_map.save(img_name)
         data_name = os.path.join(dname, 'faces.json')
         with open(data_name, 'w') as out:
-            json.dump({'faces_data': self.faces_data}, out,
+            json.dump({'image_control_objects': self.image_control_objects}, out,
                       ensure_ascii=False, indent=4, sort_keys=True)
 
-    def update_faces_data(self):
-        for i in range(len(self.faces_data)):
-            self.faces_data[i]['cob']['name'] = self.faces_widget.widget(i).name.text()
-            self.faces_data[i]['cob']['patronymic'] = self.faces_widget.widget(i).patronymic.text()
-            self.faces_data[i]['cob']['surname'] = self.faces_widget.widget(i).surname.text()
-            self.faces_data[i]['cob']['passport'] = self.faces_widget.widget(i).passport.text()
-            self.faces_data[i]['cob']['phone_num'] = self.faces_widget.widget(i).phone_num.text()
+    def update_image_control_objects(self):
+        for i in range(len(self.image_control_objects)):
+            self.image_control_objects[i]['control_object']['passport'] = self.faces_widget.widget(i).passport.text()
+            self.image_control_objects[i]['control_object']['surname'] = self.faces_widget.widget(i).surname.text()
+            self.image_control_objects[i]['control_object']['name'] = self.faces_widget.widget(i).name.text()
+            self.image_control_objects[i]['control_object']['patronymic'] = self.faces_widget.widget(
+                i).patronymic.text()
+            self.image_control_objects[i]['control_object']['sex'] = self.faces_widget.widget(i).sex.text()
+            self.image_control_objects[i]['control_object']['birthdate'] = self.faces_widget.widget(i).birthdate.text()
+            self.image_control_objects[i]['control_object']['phone_num'] = self.faces_widget.widget(i).phone_num.text()
+            self.image_control_objects[i]['control_object']['email'] = self.faces_widget.widget(i).email.text()
+            self.image_control_objects[i]['control_object']['address'] = self.faces_widget.widget(i).address.text()
 
     def submit_btn_clicked(self):
         self.submit_btn.setChecked(True)
@@ -439,14 +483,13 @@ class NotificationWindow(QWidget):
                 self.cancel_btn.isChecked():
             return
         self.submit_btn.first_time = False
-        self.update_faces_data()
+        self.update_image_control_objects()
         msg = {
-            'headers': {'src_addr': '', 'immed': False},
-            'cmd': 'submit',
-            'id': self.id,
-            'faces_data': self.faces_data
+            'header': {'src_addr': self.src_addr, 'uuid': self.uuid},
+            'command': 'submit',
+            'image_control_objects': self.image_control_objects
         }
-        self.outmq.sync_q.put(msg)
+        self.outmq.sync_q.put((self.header['src_addr'], msg))
         self.parent.sub_windows.pop(self.ts)
 
     def recognize_again_btn_clicked(self):
@@ -456,14 +499,13 @@ class NotificationWindow(QWidget):
                 self.cancel_btn.isChecked():
             return
         self.recognize_again_btn.first_time = False
-        self.update_faces_data()
+        self.update_image_control_objects()
         msg = {
-            'headers': {'src_addr': '', 'immed': False},
-            'cmd': 'recognize_again',
-            'id': self.id,
-            'faces_data': self.faces_data
+            'header': {'src_addr': self.src_addr, 'uuid': self.uuid},
+            'command': 'process_again',
+            'image_control_objects': self.image_control_objects
         }
-        self.outmq.sync_q.put(msg)
+        self.outmq.sync_q.put((self.header['src_addr'], msg))
         self.parent.sub_windows.pop(self.ts)
 
     def cancel_btn_clicked(self):
@@ -474,11 +516,10 @@ class NotificationWindow(QWidget):
             return
         self.cancel_btn.first_time = False
         msg = {
-            'headers': {'src_addr': '', 'immed': False},
-            'cmd': 'cancel',
-            'id': self.id
+            'header': {'src_addr': self.src_addr, 'uuid': self.uuid},
+            'command': 'cancel',
         }
-        self.outmq.sync_q.put(msg)
+        self.outmq.sync_q.put((self.header['src_addr'], msg))
         self.parent.sub_windows.pop(self.ts)
 
     def closeEvent(self, event):
@@ -497,10 +538,10 @@ class NotificationWindow(QWidget):
 
 
 class Painter(QWidget):
-    def __init__(self, pix_map: QPixmap, faces_data, parent: NotificationWindow):
+    def __init__(self, pix_map: QPixmap, image_control_objects, parent: NotificationWindow):
         super().__init__()
         self.pix_map = pix_map
-        self.faces_data = faces_data
+        self.image_control_objects = image_control_objects
         self.win_width = self.pix_map.width()
         self.win_height = self.pix_map.height()
         self.setFixedSize(self.win_width, self.win_height)
@@ -541,9 +582,9 @@ class Painter(QWidget):
                 else self.released_coords.y()
             left = self.pressed_coords.x() if self.pressed_coords.x() >= self.released_coords.x() \
                 else self.released_coords.x()
-            self.faces_data.append({
-                'box': [top, right, bottom, left],
-                'cob': {
+            self.image_control_objects.append({
+                'facebox': [top, right, bottom, left],
+                'control_object': {
                     'id': '-',
                     'name': '-',
                     'patronymic': '-',
@@ -553,7 +594,8 @@ class Painter(QWidget):
                     'phone_num': '-'
                 }
             })
-            face_tab = FaceTab(len(self.faces_data) - 1, self.faces_data[-1], self.parent.faces_widget)
+            face_tab = FaceTab(len(self.image_control_objects) - 1, self.image_control_objects[-1],
+                               self.parent.faces_widget)
             self.parent.faces_widget.addTab(face_tab, str(face_tab.index))
         self.update()
         self.pressed_coords = None
@@ -570,8 +612,8 @@ class Painter(QWidget):
         painter.drawPixmap(QRect(0, 0, self.pix_map.width(), self.pix_map.height()), self.pix_map)
         painter.setPen(QPen(Qt.green, 3))
         painter.setFont(QFont("DejaVu Sans Mono", 18, QtGui.QFont.PreferDefault))
-        for i in range(len(self.faces_data)):
-            fb = FaceBox(self.faces_data[i].get('box'))
+        for i in range(len(self.image_control_objects)):
+            fb = FaceBox(self.image_control_objects[i].get('facebox'))
             rect = QRect(fb.right, fb.top, fb.left - fb.right, fb.bottom - fb.top)
             painter.drawRect(rect)
             painter.drawText(rect, Qt.AlignBottom | Qt.AlignCenter, str(i))
@@ -652,11 +694,10 @@ class GUI:
 
 class HTTPServerCFG:
     def __init__(self, cfg: dict):
-        self.name = cfg['name']
-        self.socket = cfg['socket']
+        self.addr = cfg['addr']
+        self.port = cfg['port']
         self.write_timeout_ms = cfg['write_timeout_ms']
         self.read_timeout_ms = cfg['read_timeout_ms']
-        self.immed_resp = cfg['immed_resp']
         self.req_max_size = cfg['req_max_size']
         self.key_path = cfg['key_path']
         self.crt_path = cfg['crt_path']
@@ -676,22 +717,26 @@ class CFG:
 class HTTPServer:
     """HTTPServer class handles notifications about processed images."""
 
+    INVALID_REQUEST_METHOD_CODE = -1
+    CORRUPTED_BODY_CODE = -2
+    UNABLE_TO_ENQUEUE = -3
+    UNABLE_TO_SEND = -4
+    INTERNAL_SERVER_ERROR = -5
+
     STATUS_BAD_REQUEST = 400
     STATUS_INTERNAL_SERVER_ERROR = 500
 
-    API_V1_NOTIFY_IMG = '/api/v1/notify_img'
-    API_V1_CONFIRM_IMG = '/api/v1/confirm_img'
+    API_BASE = '/api/v1'
+    API_NOTIFY_CONTROL = API_BASE + '/notify_control'
+    API_NOTIFY_ADD_CONTROL_OBJECT = API_BASE + '/notify_add_control_object'
 
-    def __init__(self, cfg: CFG, loop: asyncio.BaseEventLoop, gui: GUI):
+    def __init__(self, cfg: CFG, src_addr, loop: asyncio.BaseEventLoop, gui: GUI):
+        self.src_addr = src_addr
         self.cfg = cfg
         app = web.Application(client_max_size=self.cfg.http_server_cfg.req_max_size)
-        app.add_routes([web.put(HTTPServer.API_V1_NOTIFY_IMG, self.notify_img_handler),
-                        web.put(HTTPServer.API_V1_CONFIRM_IMG, self.confirm_img_handler)])
+        app.add_routes([web.put(HTTPServer.API_NOTIFY_CONTROL, self.notify_control),
+                        web.put(HTTPServer.API_NOTIFY_ADD_CONTROL_OBJECT, self.notify_add_control_object)])
         self.app = app
-        if self.cfg.http_server_cfg.key_path != '' and self.cfg.http_server_cfg.crt_path != '':
-            self.src_addr = 'https://' + self.cfg.http_server_cfg.name
-        else:
-            self.src_addr = 'http://' + self.cfg.http_server_cfg.name
 
         self.loop = loop
         self.gui = gui
@@ -700,48 +745,46 @@ class HTTPServer:
         asyncio.set_event_loop(self.loop)
         runner = self.app.make_handler()
 
-        conn_str = self.cfg.http_server_cfg.socket
-        is_ip_port = match(r'(\d)+\.(\d)+\.(\d)+\.(\d)+:(\d)+', conn_str) is not None
         if self.cfg.http_server_cfg.crt_path != '' and self.cfg.http_server_cfg.key_path != '':
             ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             ssl_context.load_cert_chain(self.cfg.http_server_cfg.crt_path,
                                         self.cfg.http_server_cfg.key_path)
         else:
             ssl_context = None
-        if is_ip_port:
-            conn_data = conn_str.split(':')
-            host = conn_data[0]
-            port = int(conn_data[1])
-            if ssl_context is not None:
-                srv = self.loop.create_server(runner, host=host, port=port, ssl=ssl_context)
-            else:
-                srv = self.loop.create_server(runner, host=host, port=port, ssl=ssl_context)
+
+        if ssl_context is not None:
+            srv = self.loop.create_server(runner,
+                                          host=self.cfg.http_server_cfg.addr,
+                                          port=self.cfg.http_server_cfg.port,
+                                          ssl=ssl_context)
         else:
-            path = conn_str
-            if ssl_context is not None:
-                srv = self.loop.create_unix_connection(runner, path, ssl=ssl_context)
-            else:
-                srv = self.loop.create_unix_connection(runner, path, ssl=ssl_context)
+            srv = self.loop.create_server(runner,
+                                          host=self.cfg.http_server_cfg.addr,
+                                          port=self.cfg.http_server_cfg.port,
+                                          ssl=ssl_context)
 
         self.loop.run_until_complete(srv)
         self.loop.run_forever()
 
     RESP_API_V1_PUT_CONTROL = '/api/v1/put_control'
 
-    async def notify_img_handler(self, req: web.Request) -> web.Response:
+    async def notify_control(self, req: web.Request) -> web.Response:
+        req_uuid = ''
         try:
             body = await req.json()
-            headers = body['headers']
-            addr = headers['src_addr']
-            req_id = body['id']
-            b64_img_buff = body['img_buff']
-            faces = body['faces_data']
+            header = body['header']
+            addr = header['src_addr']
+            req_uuid = header['uuid']
+            img_buff = body['img_buff']
+            image_control_objects = body['image_control_objects']
         except KeyError:
             return web.json_response({
-                'headers': {'src_addr': self.src_addr, 'immed': False},
-                'id': req_id,
-                'error': True,
-                'error_info': 'invalid request data'
+                'headers': {'src_addr': self.src_addr, 'uuid': req_uuid},
+                'error_data': {
+                    'error_code': HTTPServer.CORRUPTED_BODY_CODE,
+                    'error_info': 'corrupted request body',
+                    'error_text': 'unable to read request body'
+                }
             }, status=HTTPServer.STATUS_BAD_REQUEST)
 
         msg = body
@@ -749,14 +792,11 @@ class HTTPServer:
         p = (msg, outmq)
         self.gui.mq.sync_q.put(p)
         self.gui.notify_gui()
-        if self.cfg.http_server_cfg.immed_resp:
-            asyncio.run_coroutine_threadsafe(self.notify_img_create_resp(outmq), loop=self.loop)
-            return web.json_response({'headers': {'src_addr': '', 'immed': True}})
 
-        msg = await outmq.async_q.get()
-        return web.json_response(msg)
+        asyncio.run_coroutine_threadsafe(self.notify_control_create_resp(outmq), loop=self.loop)
+        return web.json_response({'headers': {'src_addr': self.src_addr, 'uuid': req_uuid}})
 
-    async def notify_img_create_resp(self, outmq: janus.Queue):
+    async def notify_control_create_resp(self, outmq: janus.Queue):
         data = await outmq.async_q.get()
         addr = data[0]
         msg = data[1]
@@ -764,7 +804,7 @@ class HTTPServer:
                 json_serialize=json.dumps) as session:
             await session.put(addr + HTTPServer.RESP_API_V1_PUT_CONTROL, json=msg)
 
-    async def confirm_img_handler(self, req: web.Request) -> web.Response:
+    async def notify_add_control_object(self, req: web.Request) -> web.Response:
         pass
 
     async def confirm_img_create_resp(self):
@@ -797,9 +837,12 @@ def main():
 
     loop = asyncio.new_event_loop()
     mq = janus.Queue(loop=loop)
-    src_addr = 'http://' + cfg.http_server_cfg.socket
+    if cfg.http_server_cfg.key_path != '' and cfg.http_server_cfg.crt_path != '':
+        src_addr = 'https://' + cfg.http_server_cfg.addr + ':' + str(cfg.http_server_cfg.port)
+    else:
+        src_addr = 'http://' + cfg.http_server_cfg.addr + ':' + str(cfg.http_server_cfg.port)
     gui = GUI(mq, src_addr, cfg.facedb_cfg.addr)
-    http_server = HTTPServer(cfg, loop, gui)
+    http_server = HTTPServer(cfg, src_addr, loop, gui)
     t = threading.Thread(target=http_server.run, name='http_server')
     t.daemon = True
     t.start()
