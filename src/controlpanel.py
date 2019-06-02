@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import datetime
 import json
 import os
 import ssl
@@ -41,8 +42,9 @@ class FaceBox:
 
 
 class FaceTabsWidget(QTabWidget):
-    def __init__(self, image_control_objects):
+    def __init__(self, image_control_objects, parent):
         super().__init__()
+        self.parent = parent
         self.image_control_objects = image_control_objects
         self.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
 
@@ -157,10 +159,11 @@ class FaceTab(QWidget):
     def delete_btn_clicked(self):
         self.parent.removeTab(self.index)
         del self.parent.image_control_objects[self.index]
-        for i in range(self.index, self.parent.count()):
+        for i in range(self.parent.count()):
             w = self.parent.widget(i)
             w.index = i
             self.parent.setTabText(w.index, str(w.index))
+        self.parent.parent.drawing_area.update()
 
 
 class MainWindow(QMainWindow):
@@ -171,6 +174,9 @@ class MainWindow(QMainWindow):
 
         self.app = app
         self.mq = mq
+
+        self.awaiting_control_objects = {}
+        self.awaiting_controls = {}
 
         self.app_name = app_name
         self.static_path = static_path
@@ -190,8 +196,6 @@ class MainWindow(QMainWindow):
         self.user_trigger.sig.connect(self.user_trigger_cb)
         self.sub_windows = {}
         self.__init_main_window()
-
-        self.face_id = 0
 
     def __init_main_window(self):
         self.resize(*self.w_size)
@@ -255,20 +259,34 @@ class MainWindow(QMainWindow):
         req = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
         req.setHeader(QtNetwork.QNetworkRequest.ContentTypeHeader,
                       'application/json')
-        img = Image.open(fname)
-        bytes_io = BytesIO()
-        img.save(bytes_io, format='PNG')
-        img_buff = str(b64encode(bytes_io.getvalue()))
-        img_buff = img_buff[2:len(img_buff) - 1]
+        try:
+            img = Image.open(fname)
+            bytes_io = BytesIO()
+            img.save(bytes_io, format='PNG')
+            img_buff = str(b64encode(bytes_io.getvalue()))
+            img_buff = img_buff[2:len(img_buff) - 1]
+        except Exception:
+            warn = QMessageBox()
+            warn.setStandardButtons(QMessageBox.Ok)
+            warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+            warn.setText("""Chosen file is not an image. Dropping request.""")
+            warn.exec_()
+            return
+
+        find_face_id = str(uuid.uuid4())
+        self.awaiting_controls[find_face_id] = {
+            'ts': datetime.datetime.now(),
+            'fname': fname
+        }
         json_data = {
-            'header': {'src_addr': self.src_addr, 'uuid': str(uuid.uuid4())},
+            'header': {'src_addr': self.src_addr, 'uuid': find_face_id},
             'img_buff': img_buff,
         }
         req_data = QtCore.QByteArray()
         req_data.append(json.dumps(json_data, ensure_ascii=False))
         self.network_manager.put(req, req_data)
 
-    REQ_API_V1_ADD_FACE = '/api/v1/add_face'
+    REQ_API_V1_ADD_CONTROL_OBJECT = '/api/v1/add_control_object'
 
     def __upload_action_started(self):
         dname = QFileDialog.getExistingDirectory(self, 'Choose dir', str(Path.home()))
@@ -302,12 +320,33 @@ class MainWindow(QMainWindow):
             warn.exec_()
             return
 
-        face_id = self.face_id
-        self.face_id += 1
+        url = self.facedb_addr + MainWindow.REQ_API_V1_ADD_CONTROL_OBJECT
 
-        url = self.facedb_addr + MainWindow.REQ_API_V1_ADD_FACE
+        img_buffs = []
+        for img_name in imgs_names:
+            try:
+                img = Image.open(img_name)
+                bytes_io = BytesIO()
+                img.save(bytes_io, format='PNG')
+                img_buff = str(b64encode(bytes_io.getvalue()))
+                img_buff = img_buff[2:len(img_buff) - 1]
+            except Exception:
+                warn = QMessageBox()
+                warn.setStandardButtons(QMessageBox.Ok)
+                warn.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+                warn.setText('File "%s" is not an image. Dropping request.' % img_name)
+                warn.exec_()
+                return
+            img_buffs.append(img_buff)
+
+        add_face_uuid = str(uuid.uuid4())
+        self.awaiting_control_objects[add_face_uuid] = {
+            'ts': datetime.datetime.now(),
+            'dname': dname
+        }
 
         # Send JSON data.
+
         req = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
         req.setHeader(QtNetwork.QNetworkRequest.ContentTypeHeader,
                       'application/json')
@@ -315,28 +354,30 @@ class MainWindow(QMainWindow):
             data = json.load(f)
         data['id'] = '-'
         json_data = {
-            'header': {'src_addr': self.src_addr, 'immed': False},
-            'id': face_id,
-            'cob': data,
-            'imgs_number': len(imgs_names)
+            'header': {'src_addr': self.src_addr, 'uuid': add_face_uuid},
+            'control_object_part': {
+                'control_object': data,
+                'images_num': len(imgs_names)
+            },
+            'image_part': None
         }
         req_data = QtCore.QByteArray()
         req_data.append(json.dumps(json_data, ensure_ascii=False))
         self.network_manager.post(req, req_data)
 
         # Send all images.
-        for img_name in imgs_names:
+        for i in range(len(img_buffs)):
             req = QtNetwork.QNetworkRequest(QtCore.QUrl(url))
             req.setHeader(QtNetwork.QNetworkRequest.ContentTypeHeader,
                           'application/json')
-            with open(img_name, "rb") as f:
-                img_buff = f.read()
-                b64_img_buff = str(b64encode(img_buff))
-                b64_img_buff = b64_img_buff[2:len(b64_img_buff) - 1]
             json_data = {
-                'header': {'src_addr': self.src_addr, 'immed': False},
-                'id': face_id,
-                'img_buff': b64_img_buff,
+                'header': {'src_addr': self.src_addr, 'uuid': add_face_uuid},
+                'control_object_part': None,
+                'image_part': {
+                    'curr_num': i,
+                    'img_buff': img_buffs[i],
+                    'facebox': None
+                }
             }
             req_data = QtCore.QByteArray()
             req_data.append(json.dumps(json_data, ensure_ascii=False))
@@ -363,12 +404,18 @@ class MainWindow(QMainWindow):
 
     def user_trigger_cb(self):
         p = self.mq.sync_q.get()
-        msg = p[0]
-        outmq = p[1]
+        if p[0] == 'notify_control':
+            self.on_notify_control(p)
+        elif p[0] == 'notify_add_control_object':
+            self.on_notify_add_control_object(p)
+
+    def on_notify_control(self, p):
+        msg = p[1]
+        outmq = p[2]
 
         header = msg.get('header')
 
-        uuid = header.get('uuid')
+        req_uuid = header.get('uuid')
 
         img_buff = msg.get('img_buff')
         img_buff = b64decode(img_buff)
@@ -379,13 +426,29 @@ class MainWindow(QMainWindow):
         pix_map.loadFromData(img_buff.getvalue())
 
         image_control_objects = msg.get('image_control_objects')
-
+        if self.awaiting_controls.get(req_uuid) is not None:
+            aw_control = self.awaiting_controls.pop(req_uuid)
+            win_name = '"%s" in %s' % (aw_control['fname'], (datetime.datetime.now() - aw_control['ts']))
+        else:
+            win_name = 'Unknown new image'
         cur_time = clock()
-        nw = NotificationWindow(self.src_addr, 'NW', header, uuid, pix_map, image_control_objects, outmq, cur_time,
+        nw = NotificationWindow(self.src_addr, win_name, header, req_uuid, pix_map, image_control_objects, outmq, cur_time,
                                 self)
         self.sub_windows[cur_time] = nw
         nw.show()
 
+    def on_notify_add_control_object(self, p):
+        notify = QMessageBox()
+        notify.setStandardButtons(QMessageBox.Ok)
+        notify.setFont(QFont("DejaVu Sans Mono", 12, QtGui.QFont.PreferDefault))
+        req_uuid = p[1].get('header').get('uuid')
+        if self.awaiting_control_objects.get(req_uuid) is not None:
+            aw_cob = self.awaiting_control_objects.pop(req_uuid)
+            notify.setText('"AddControlObject" request for folder "%s" in %s seconds' %
+                           (aw_cob['dname'], (datetime.datetime.now() - aw_cob['ts'])))
+        else:
+            notify.setText('Unknown "AddControlObject" request was processed')
+        notify.exec_()
 
 class NotificationWindow(QWidget):
     def __init__(self, src_addr, win_name: str, header, uuid, pix_map: QPixmap, image_control_objects,
@@ -410,7 +473,8 @@ class NotificationWindow(QWidget):
         self.grid = QGridLayout()
         self.setLayout(self.grid)
 
-        self.drawing_area = Painter(self.pix_map, self.image_control_objects, self)
+        self.drawing_area = Painter(self.pix_map, self.size().width(), self.size().height(), self.image_control_objects,
+                                    self)
         self.grid.addWidget(self.drawing_area, 0, 0, 5, 1)
 
         self.submit_btn = PushButtonOnce('submit', self)
@@ -441,7 +505,7 @@ class NotificationWindow(QWidget):
         self.save_data_btn.clicked.connect(self.save_data_btn_clicked)
         self.grid.addWidget(self.save_data_btn, 3, 1)
 
-        self.faces_widget = FaceTabsWidget(self.image_control_objects)
+        self.faces_widget = FaceTabsWidget(self.image_control_objects, self)
         for i in range(len(self.image_control_objects)):
             face_tab = FaceTab(i, self.image_control_objects[i], self.faces_widget)
             self.faces_widget.addTab(face_tab, str(face_tab.index))
@@ -538,13 +602,18 @@ class NotificationWindow(QWidget):
 
 
 class Painter(QWidget):
-    def __init__(self, pix_map: QPixmap, image_control_objects, parent: NotificationWindow):
+    def __init__(self, pix_map: QPixmap, max_width, max_height, image_control_objects, parent: NotificationWindow):
         super().__init__()
-        self.pix_map = pix_map
+        width_coef = pix_map.width() / max_width
+        height_coef = pix_map.height() / max_height
+        if (width_coef > height_coef) and (height_coef >= 1.0):
+            self.coef = height_coef
+        else:
+            self.coef = width_coef
+        self.setFixedSize(int(pix_map.width() / self.coef), int(pix_map.height() / self.coef))
+        self.pix_map = pix_map.scaled(int(pix_map.width() / self.coef),
+                                      int(pix_map.height() / self.coef))
         self.image_control_objects = image_control_objects
-        self.win_width = self.pix_map.width()
-        self.win_height = self.pix_map.height()
-        self.setFixedSize(self.win_width, self.win_height)
         self.show()
         self.pressed_coords = None
         self.released_coords = None
@@ -583,15 +652,21 @@ class Painter(QWidget):
             left = self.pressed_coords.x() if self.pressed_coords.x() >= self.released_coords.x() \
                 else self.released_coords.x()
             self.image_control_objects.append({
-                'facebox': [top, right, bottom, left],
+                'facebox': [int(self.coef * top),
+                            int(self.coef * right),
+                            int(self.coef * bottom),
+                            int(self.coef * left)],
                 'control_object': {
                     'id': '-',
+                    'passport': '-',
+                    'surname': '-',
                     'name': '-',
                     'patronymic': '-',
-                    'surname': '-',
-                    'passport': '-',
                     'sex': '-',
-                    'phone_num': '-'
+                    'birthdate': '-',
+                    'phone_num': '-',
+                    'email': '-',
+                    'address': '-'
                 }
             })
             face_tab = FaceTab(len(self.image_control_objects) - 1, self.image_control_objects[-1],
@@ -602,8 +677,8 @@ class Painter(QWidget):
         self.released_coords = None
 
     def __is_point_in_img(self, p: QPoint) -> bool:
-        if (p.x() >= 0) and (p.x() < self.win_width) and \
-                (p.y() >= 0) and (p.y() < self.win_height):
+        if (p.x() >= 0) and (p.x() < self.width()) and \
+                (p.y() >= 0) and (p.y() < self.height()):
             return True
         return False
 
@@ -614,7 +689,10 @@ class Painter(QWidget):
         painter.setFont(QFont("DejaVu Sans Mono", 18, QtGui.QFont.PreferDefault))
         for i in range(len(self.image_control_objects)):
             fb = FaceBox(self.image_control_objects[i].get('facebox'))
-            rect = QRect(fb.right, fb.top, fb.left - fb.right, fb.bottom - fb.top)
+            rect = QRect(int(fb.right / self.coef),
+                         int(fb.top / self.coef),
+                         int((fb.left - fb.right) / self.coef),
+                         int((fb.bottom - fb.top) / self.coef))
             painter.drawRect(rect)
             painter.drawText(rect, Qt.AlignBottom | Qt.AlignCenter, str(i))
         if self.cur_box is not None and (self.released_coords is None or self.__is_point_in_img(self.released_coords)):
@@ -789,7 +867,7 @@ class HTTPServer:
 
         msg = body
         outmq = janus.Queue(loop=self.loop)
-        p = (msg, outmq)
+        p = ('notify_control', msg, outmq)
         self.gui.mq.sync_q.put(p)
         self.gui.notify_gui()
 
@@ -805,10 +883,28 @@ class HTTPServer:
             await session.put(addr + HTTPServer.RESP_API_V1_PUT_CONTROL, json=msg)
 
     async def notify_add_control_object(self, req: web.Request) -> web.Response:
-        pass
+        req_uuid = ''
+        try:
+            body = await req.json()
+            header = body['header']
+            addr = header['src_addr']
+            req_uuid = header['uuid']
+        except KeyError:
+            return web.json_response({
+                'headers': {'src_addr': self.src_addr, 'uuid': req_uuid},
+                'error_data': {
+                    'error_code': HTTPServer.CORRUPTED_BODY_CODE,
+                    'error_info': 'corrupted request body',
+                    'error_text': 'unable to read request body'
+                }
+            }, status=HTTPServer.STATUS_BAD_REQUEST)
 
-    async def confirm_img_create_resp(self):
-        pass
+        msg = body
+        p = ('notify_add_control_object', msg)
+        self.gui.mq.sync_q.put(p)
+        self.gui.notify_gui()
+
+        return web.json_response({'headers': {'src_addr': self.src_addr, 'uuid': req_uuid}})
 
 
 DESC_STR = r"""FaceRecognition is a simple script, that finds all faces in image
